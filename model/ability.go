@@ -16,6 +16,13 @@ type Ability struct {
 
 func GetRandomSatisfiedChannel(group string, model string) (*Channel, error) {
 	ability := Ability{}
+	groupCol := "`group`"
+	trueVal := "1"
+	if common.UsingPostgreSQL {
+		groupCol = `"group"`
+		trueVal = "true"
+	}
+
 	var err error = nil
 	if common.UsingSQLite {
 		//	根据sort和random排序

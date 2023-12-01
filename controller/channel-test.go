@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
+	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/model"
@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-func testChannel(channel *model.Channel, request ChatRequest) (error, *OpenAIError) {
+func testChannel(channel *model.Channel, request ChatRequest) (err error, openaiErr *OpenAIError) {
 	switch channel.Type {
 	case common.ChannelTypePaLM:
 		fallthrough
@@ -34,19 +36,24 @@ func testChannel(channel *model.Channel, request ChatRequest) (error, *OpenAIErr
 		return errors.New("该渠道类型当前版本不支持测试，请手动测试"), nil
 	case common.ChannelTypeAzure:
 		request.Model = "gpt-35-turbo"
+		defer func() {
+			if err != nil {
+				err = errors.New("请确保已在 Azure 上创建了 gpt-35-turbo 模型，并且 apiVersion 已正确填写！")
+			}
+		}()
 	default:
 		request.Model = "gpt-3.5-turbo"
 	}
 	requestURL := common.ChannelBaseURLs[channel.Type]
 	if channel.Type == common.ChannelTypeAzure {
-		requestURL = fmt.Sprintf("%s/openai/deployments/%s/chat/completions?api-version=2023-03-15-preview", channel.BaseURL, request.Model)
+		requestURL = getFullRequestURL(channel.GetBaseURL(), fmt.Sprintf("/openai/deployments/%s/chat/completions?api-version=2023-03-15-preview", request.Model), channel.Type)
 	} else {
-		if channel.BaseURL != "" {
-			requestURL = channel.BaseURL
+		if baseURL := channel.GetBaseURL(); len(baseURL) > 0 {
+			requestURL = baseURL
 		}
-		requestURL += "/v1/chat/completions"
-	}
 
+		requestURL = getFullRequestURL(requestURL, "/v1/chat/completions", channel.Type)
+	}
 	jsonData, err := json.Marshal(request)
 	if err != nil {
 		return err, nil
@@ -161,7 +168,7 @@ func disableChannel(channelId int, channelName string, reason string) {
 	if common.RootUserEmail == "" {
 		common.RootUserEmail = model.GetRootUserEmail()
 	}
-	model.UpdateChannelStatusById(channelId, common.ChannelStatusDisabled)
+	model.UpdateChannelStatusById(channelId, common.ChannelStatusAutoDisabled)
 	subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelName, channelId)
 	content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelName, channelId, reason)
 	err := common.SendEmail(subject, common.RootUserEmail, content)

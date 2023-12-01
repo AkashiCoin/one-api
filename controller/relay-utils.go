@@ -1,52 +1,64 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/pkoukk/tiktoken-go"
 	"io"
 	"net/http"
 	"one-api/common"
+	"one-api/model"
 	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/pkoukk/tiktoken-go"
 )
 
 var stopFinishReason = "stop"
 
+// tokenEncoderMap won't grow after initialization
 var tokenEncoderMap = map[string]*tiktoken.Tiktoken{}
+var defaultTokenEncoder *tiktoken.Tiktoken
 
 func InitTokenEncoders() {
 	common.SysLog("initializing token encoders")
-	fallbackTokenEncoder, err := tiktoken.EncodingForModel("gpt-3.5-turbo")
+	gpt35TokenEncoder, err := tiktoken.EncodingForModel("gpt-3.5-turbo")
 	if err != nil {
-		common.FatalLog(fmt.Sprintf("failed to get fallback token encoder: %s", err.Error()))
+		common.FatalLog(fmt.Sprintf("failed to get gpt-3.5-turbo token encoder: %s", err.Error()))
+	}
+	defaultTokenEncoder = gpt35TokenEncoder
+	gpt4TokenEncoder, err := tiktoken.EncodingForModel("gpt-4")
+	if err != nil {
+		common.FatalLog(fmt.Sprintf("failed to get gpt-4 token encoder: %s", err.Error()))
 	}
 	for model, _ := range common.ModelRatio {
-		tokenEncoder, err := tiktoken.EncodingForModel(model)
-		if err != nil {
-			common.SysError(fmt.Sprintf("using fallback encoder for model %s", model))
-			tokenEncoderMap[model] = fallbackTokenEncoder
-			continue
+		if strings.HasPrefix(model, "gpt-3.5") {
+			tokenEncoderMap[model] = gpt35TokenEncoder
+		} else if strings.HasPrefix(model, "gpt-4") {
+			tokenEncoderMap[model] = gpt4TokenEncoder
+		} else {
+			tokenEncoderMap[model] = nil
 		}
-		tokenEncoderMap[model] = tokenEncoder
 	}
 	common.SysLog("token encoders initialized")
 }
 
 func getTokenEncoder(model string) *tiktoken.Tiktoken {
-	if tokenEncoder, ok := tokenEncoderMap[model]; ok {
+	tokenEncoder, ok := tokenEncoderMap[model]
+	if ok && tokenEncoder != nil {
 		return tokenEncoder
 	}
-	tokenEncoder, err := tiktoken.EncodingForModel(model)
-	if err != nil {
-		common.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using encoder for gpt-3.5-turbo", model, err.Error()))
-		tokenEncoder, err = tiktoken.EncodingForModel("gpt-3.5-turbo")
+	if ok {
+		tokenEncoder, err := tiktoken.EncodingForModel(model)
 		if err != nil {
-			common.FatalLog(fmt.Sprintf("failed to get token encoder for model gpt-3.5-turbo: %s", err.Error()))
+			common.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using encoder for gpt-3.5-turbo", model, err.Error()))
+			tokenEncoder = defaultTokenEncoder
 		}
+		tokenEncoderMap[model] = tokenEncoder
+		return tokenEncoder
 	}
-	tokenEncoderMap[model] = tokenEncoder
-	return tokenEncoder
+	return defaultTokenEncoder
 }
 
 func getTokenNum(tokenEncoder *tiktoken.Tiktoken, text string) int {
@@ -75,7 +87,7 @@ func countTokenMessages(messages []Message, model string) int {
 	tokenNum := 0
 	for _, message := range messages {
 		tokenNum += tokensPerMessage
-		tokenNum += getTokenNum(tokenEncoder, message.Content)
+		tokenNum += getTokenNum(tokenEncoder, message.StringContent())
 		tokenNum += getTokenNum(tokenEncoder, message.Role)
 		if message.Name != nil {
 			tokenNum += tokensPerName
@@ -162,7 +174,7 @@ func relayErrorHandler(resp *http.Response) (openAIErrorWithStatusCode *OpenAIEr
 		StatusCode: resp.StatusCode,
 		OpenAIError: OpenAIError{
 			Message: fmt.Sprintf("bad response status code %d", resp.StatusCode),
-			Type:    "one_api_error",
+			Type:    "upstream_error",
 			Code:    "bad_response_status_code",
 			Param:   strconv.Itoa(resp.StatusCode),
 		},
@@ -182,4 +194,41 @@ func relayErrorHandler(resp *http.Response) (openAIErrorWithStatusCode *OpenAIEr
 	}
 	openAIErrorWithStatusCode.OpenAIError = textResponse.Error
 	return
+}
+
+func getFullRequestURL(baseURL string, requestURL string, channelType int) string {
+	fullRequestURL := fmt.Sprintf("%s%s", baseURL, requestURL)
+
+	if strings.HasPrefix(baseURL, "https://gateway.ai.cloudflare.com") {
+		switch channelType {
+		case common.ChannelTypeOpenAI:
+			fullRequestURL = fmt.Sprintf("%s%s", baseURL, strings.TrimPrefix(requestURL, "/v1"))
+		case common.ChannelTypeAzure:
+			fullRequestURL = fmt.Sprintf("%s%s", baseURL, strings.TrimPrefix(requestURL, "/openai/deployments"))
+		}
+	}
+
+	return fullRequestURL
+}
+
+func postConsumeQuota(ctx context.Context, tokenId int, quotaDelta int, totalQuota int, userId int, channelId int, modelRatio float64, groupRatio float64, modelName string, tokenName string) {
+	// quotaDelta is remaining quota to be consumed
+	err := model.PostConsumeTokenQuota(tokenId, quotaDelta)
+	if err != nil {
+		common.SysError("error consuming token remain quota: " + err.Error())
+	}
+	err = model.CacheUpdateUserQuota(userId)
+	if err != nil {
+		common.SysError("error update user quota cache: " + err.Error())
+	}
+	// totalQuota is total quota consumed
+	if totalQuota != 0 {
+		logContent := fmt.Sprintf("模型倍率 %.2f，分组倍率 %.2f", modelRatio, groupRatio)
+		model.RecordConsumeLog(ctx, userId, channelId, totalQuota, 0, modelName, tokenName, totalQuota, logContent)
+		model.UpdateUserUsedQuotaAndRequestCount(userId, totalQuota)
+		model.UpdateChannelUsedQuota(channelId, totalQuota)
+	}
+	if totalQuota <= 0 {
+		common.LogError(ctx, fmt.Sprintf("totalQuota consumed is %d, something is wrong", totalQuota))
+	}
 }
